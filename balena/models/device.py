@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 import json
 from collections import defaultdict
+import semver
 
 try:  # Python 3 imports
     from urllib.parse import urljoin
@@ -12,11 +13,13 @@ except ImportError:  # Python 2 imports
 
 from ..base_request import BaseRequest
 from .config import Config
+from .device_os import DeviceOs
 from ..settings import Settings
 from ..auth import Auth
 from .. import exceptions
 from .application import Application
 from .release import Release
+from .hup import Hup
 
 
 # TODO: support both device uuid and device id
@@ -51,6 +54,8 @@ class Device(object):
         self.application = Application()
         self.auth = Auth()
         self.release = Release()
+        self.device_os = DeviceOs()
+        self.hup = Hup()
 
     def get(self, uuid):
         """
@@ -1196,4 +1201,96 @@ class Device(object):
         return self.base_request.request(
             '/supervisor/v1/device', 'POST', data=data,
             endpoint=self.settings.get('api_endpoint')
+        )
+
+    def __check_os_update_target(self, device_info, target_os_version):
+        """
+        """
+
+        if 'uuid' not in device_info and not device_info['uuid']:
+            raise exceptions.OsUpdateError('The uuid of the device is not available')
+
+        if 'is_online' not in device_info and not device_info['is_online']:
+            raise exceptions.OsUpdateError('The device is offline: {uuid}'.format(uuid=uuid))
+
+        if 'os_version' not in device_info and not device_info['os_version']:
+            raise exceptions.OsUpdateError('The current os version of the device is not available: {uuid}'.format(uuid=uuid))
+
+        if 'device_type' not in device_info and not device_info['device_type']:
+            raise exceptions.OsUpdateError('The device type of the device is not available: {uuid}'.format(uuid=uuid))
+
+        if 'os_variant' not in device_info:
+            raise exceptions.OsUpdateError('The os variant of the device is not available: {uuid}'.format(uuid=uuid))
+
+        current_os_version = self.device_os.get_device_os_semver_with_variant(device_info['os_version'], device_info['os_variant'])
+        self.hup.get_hup_action_type(device_info['device_type'], current_os_version, target_os_version)
+
+    def start_os_update(self, uuid, target_os_version):
+        """
+        Start an OS update on a device.
+
+        Args:
+            uuid (str): device uuid.
+            target_os_version (str): semver-compatible version for the target device.
+                Unsupported (unpublished) version will result in rejection.
+                The version **must** be the exact version number, a "prod" variant and greater than the one running on the device.
+
+        Returns:
+            dict: action response.
+
+        Raises:
+            DeviceNotFound: if device couldn't be found.
+            InvalidParameter|OsUpdateError: if target_os_version is invalid.
+
+        Examples:
+            >>> balena.models.device.start_os_update('b6070f4fea5edf808b576123157fe5ec', '2.29.2+rev1.prod')
+            {u'status': u'in_progress', u'action': u'resinhup', u'parameters': {u'target_version': u'2.29.2+rev1.prod'}, u'last_run': 1554490809219L}
+        """
+
+        device = self.get(uuid)
+        # this will throw an error if the action is not available
+        self.__check_os_update_target(device, target_os_version)
+
+        all_versions = self.device_os.get_supported_versions(device['device_type'])['versions']
+        if not [i for i in all_versions if semver.compare(target_os_version, i) == 0]:
+            raise exceptions.InvalidParameter('target_os_version', target_os_version)
+
+        data = {
+            'parameters': {
+                'target_version': target_os_version
+            }
+        }
+
+        return self.base_request.request(
+            '{uuid}/{action_name}'.format(uuid=uuid, action_name=self.device_os.OS_UPDATE_ACTION_NAME),
+            'POST',
+            data=data,
+            endpoint='https://actions.{device_url_base}/{device_actions_api_version}/'.format(
+                device_url_base=self.config.get_all()['deviceUrlsBase'],
+                device_actions_api_version=self.settings.get('device_actions_endpoint_version')
+            )
+        )
+
+    def get_os_update_status(self, uuid):
+        """
+        Get the OS update status of a device.
+
+        Args:
+            uuid (str): device uuid.
+
+        Returns:
+            dict: action response.
+
+        Examples:
+            >>> balena.models.device.get_os_update_status('b6070f4fea5edf808b576123157fe5ec')
+            {u'status': u'done', u'parameters': {u'target_version': u'2.29.2+rev1.prod'}, u'stdout': u'[1554490814][LOG]Normalized target version: 2.29.2+rev1\n', u'last_run': 1554491107242L, u'error': u'', u'action': u'resinhup'}
+        """
+
+        return self.base_request.request(
+            '{uuid}/{action_name}'.format(uuid=uuid, action_name=self.device_os.OS_UPDATE_ACTION_NAME),
+            'GET',
+            endpoint='https://actions.{device_url_base}/{device_actions_api_version}/'.format(
+                device_url_base=self.config.get_all()['deviceUrlsBase'],
+                device_actions_api_version=self.settings.get('device_actions_endpoint_version')
+            )
         )
